@@ -284,7 +284,7 @@ func batchDownload(g3 Gen3Interface, batchFDRSlice []commonUtils.FileDownloadRes
 	return succeeded
 }
 
-func downloadFile(objects []ManifestObject, downloadPath string, filenameFormat string, rename bool, noPrompt bool, protocol string, numParallel int, skipCompleted bool) {
+func downloadFile(objects []ManifestObject, downloadPath string, filenameFormat string, rename bool, noPrompt bool, protocol string, numParallel int, skipCompleted bool, debug bool) {
 	if numParallel < 1 {
 		log.Fatalln("Invalid value for option \"numparallel\": must be a positive integer! Please check your input.")
 	}
@@ -337,6 +337,7 @@ func downloadFile(objects []ManifestObject, downloadPath string, filenameFormat 
 			fdrObject = validateLocalFileStat(downloadPath, filename, filesize, skipCompleted)
 		}
 		fdrObject.GUID = obj.ObjectID
+		fdrObject.Debug = debug
 		fdrObjects = append(fdrObjects, fdrObject)
 		fileInfoBar.Increment()
 	}
@@ -433,7 +434,7 @@ func init() {
 				log.Fatalf("Error has occurred during unmarshalling manifest object: %v\n", err)
 			}
 
-			downloadFile(objects, downloadPath, filenameFormat, rename, noPrompt, protocol, numParallel, skipCompleted)
+			downloadFile(objects, downloadPath, filenameFormat, rename, noPrompt, protocol, numParallel, skipCompleted, false)
 			err = logs.CloseMessageLog()
 			if err != nil {
 				log.Println(err.Error())

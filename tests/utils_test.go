@@ -1,10 +1,13 @@
 package tests
 
 import (
+	"bytes"
 	"encoding/json"
 	"fmt"
 	"io/ioutil"
+	"log"
 	"net/http"
+	"net/url"
 	"strings"
 	"testing"
 
@@ -134,6 +137,74 @@ func TestGetDownloadResponse_noShepherd(t *testing.T) {
 	}
 	if mockFDRObj.Response != &mockFileResponse {
 		t.Errorf("Wanted download response to be %v, got %v", mockFileResponse, mockFDRObj.Response)
+	}
+}
+
+func TestGetDownloadResponseDebugRedactsSignedURL(t *testing.T) {
+	for _, tc := range []struct {
+		name         string
+		protocolText string
+		protocolLog  string
+		status       int
+	}{
+		{name: "default", protocolText: "", protocolLog: "default", status: http.StatusForbidden},
+		{name: "s3", protocolText: "?protocol=s3", protocolLog: "s3", status: http.StatusOK},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var output bytes.Buffer
+			originalWriter := log.Writer()
+			log.SetOutput(&output)
+			defer log.SetOutput(originalWriter)
+
+			const guid = "dg.4503/00000000-0000-0000-0000-000000000000"
+			const signedURL = "https://bucket.example.org/private/file.xml?X-Amz-Signature=secret-token"
+			finalURL, err := url.Parse(signedURL)
+			if err != nil {
+				t.Fatal(err)
+			}
+			response := &http.Response{
+				StatusCode: tc.status,
+				Body:       ioutil.NopCloser(strings.NewReader("test response")),
+				Request:    &http.Request{URL: finalURL},
+			}
+			defer response.Body.Close()
+
+			controller := gomock.NewController(t)
+			defer controller.Finish()
+			client := mocks.NewMockGen3Interface(controller)
+			client.EXPECT().CheckForShepherdAPI(gomock.Any()).Return(false, nil)
+			client.EXPECT().DoRequestWithSignedHeader(
+				gomock.Any(), commonUtils.FenceDataDownloadEndpoint+"/"+guid+tc.protocolText, "", nil,
+			).Return(jwt.JsonMessage{URL: signedURL}, nil)
+			client.EXPECT().MakeARequest(
+				http.MethodGet, signedURL, "", "", map[string]string{}, nil, true,
+			).Return(response, nil)
+
+			file := commonUtils.FileDownloadResponseObject{GUID: guid, Debug: true}
+			err = g3cmd.GetDownloadResponse(client, &file, tc.protocolText)
+			if tc.status == http.StatusOK && err != nil {
+				t.Fatal(err)
+			}
+			if tc.status == http.StatusForbidden && err == nil {
+				t.Fatal("expected a download error")
+			}
+
+			logged := output.String()
+			for _, want := range []string{
+				"signer=fence protocol=" + tc.protocolLog,
+				"url_scheme=https url_host=bucket.example.org",
+				fmt.Sprintf("http_status=%d final_url_host=bucket.example.org", tc.status),
+			} {
+				if !strings.Contains(logged, want) {
+					t.Errorf("debug log missing %q: %s", want, logged)
+				}
+			}
+			for _, secret := range []string{"private/file.xml", "X-Amz-Signature", "secret-token"} {
+				if strings.Contains(logged, secret) {
+					t.Errorf("debug log exposed signed URL content %q", secret)
+				}
+			}
+		})
 	}
 }
 

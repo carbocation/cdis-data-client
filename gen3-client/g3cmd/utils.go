@@ -38,7 +38,7 @@ type ManifestObject struct {
 // InitRequestObject represents the payload that sends to FENCE for getting a singlepart upload presignedURL or init a multipart upload for new object file
 type InitRequestObject struct {
 	Filename string `json:"file_name"`
-	Bucket 	 string `json:"bucket,omitempty"`
+	Bucket   string `json:"bucket,omitempty"`
 }
 
 // ShepherdInitRequestObject represents the payload that sends to Shepherd for getting a singlepart upload presignedURL or init a multipart upload for new object file
@@ -58,7 +58,7 @@ type MultipartUploadRequestObject struct {
 	Key        string `json:"key"`
 	UploadID   string `json:"uploadId"`
 	PartNumber int    `json:"partNumber"`
-	Bucket 	   string `json:"bucket,omitempty"`
+	Bucket     string `json:"bucket,omitempty"`
 }
 
 // MultipartCompleteRequestObject represents the payload that sends to FENCE for completeing a multipart upload
@@ -66,7 +66,7 @@ type MultipartCompleteRequestObject struct {
 	Key      string                `json:"key"`
 	UploadID string                `json:"uploadId"`
 	Parts    []MultipartPartObject `json:"parts"`
-	Bucket 	 string `json:"bucket,omitempty"`
+	Bucket   string                `json:"bucket,omitempty"`
 }
 
 // MultipartPartObject represents a part object
@@ -198,11 +198,13 @@ func GetDownloadResponse(g3 Gen3Interface, fdrObject *commonUtils.FileDownloadRe
 	// Attempt to get the file download URL from Shepherd if it's deployed in this commons,
 	// otherwise fall back to Fence.
 	var fileDownloadURL string
+	signer := "fence"
 	hasShepherd, err := g3.CheckForShepherdAPI(&profileConfig)
 	if err != nil {
 		log.Println("Error occurred when checking for Shepherd API: " + err.Error())
 		log.Println("Falling back to Indexd...")
 	} else if hasShepherd {
+		signer = "shepherd"
 		endPointPostfix := commonUtils.ShepherdEndpoint + "/objects/" + fdrObject.GUID + "/download"
 		_, r, err := g3.GetResponse(&profileConfig, endPointPostfix, "GET", "", nil)
 		if err != nil {
@@ -241,8 +243,22 @@ func GetDownloadResponse(g3 Gen3Interface, fdrObject *commonUtils.FileDownloadRe
 		fileDownloadURL = msg.URL
 	}
 
-	// TODO: for now we don't print fdrObject.URL in error messages since it is sensitive
-	// Later after we had log level we could consider for putting URL into debug logs...
+	// Signed URL paths and query strings can contain private data or temporary credentials.
+	if fdrObject.Debug {
+		protocol := strings.TrimPrefix(protocolText, "?protocol=")
+		if protocol == "" {
+			protocol = "default"
+		}
+		if signer == "shepherd" {
+			protocol = "handled-by-shepherd"
+		}
+		routeURL, parseErr := url.Parse(fileDownloadURL)
+		if parseErr != nil || routeURL.Hostname() == "" {
+			log.Printf("Download debug: signer=%s protocol=%s url_host=unavailable", signer, protocol)
+		} else {
+			log.Printf("Download debug: signer=%s protocol=%s url_scheme=%s url_host=%s", signer, protocol, routeURL.Scheme, routeURL.Hostname())
+		}
+	}
 	fdrObject.URL = fileDownloadURL
 	if fdrObject.Range != 0 && !strings.Contains(fdrObject.URL, "X-Amz-Signature") && !strings.Contains(fdrObject.URL, "X-Goog-Signature") { // Not S3 or GS URLs and we want resume, send HEAD req first to check if server supports range
 		resp, err := http.Head(fdrObject.URL)
@@ -265,6 +281,13 @@ func GetDownloadResponse(g3 Gen3Interface, fdrObject *commonUtils.FileDownloadRe
 		errorMsg := "Error occurred when making request to URL associated with GUID " + fdrObject.GUID
 		errorMsg += "\n Details of error: " + sanitizeErrorMsg(err.Error(), fdrObject.URL)
 		return errors.New(errorMsg)
+	}
+	if fdrObject.Debug {
+		finalHost := "unavailable"
+		if resp.Request != nil && resp.Request.URL != nil {
+			finalHost = resp.Request.URL.Hostname()
+		}
+		log.Printf("Download debug: http_status=%d final_url_host=%s", resp.StatusCode, finalHost)
 	}
 	if resp.StatusCode != 200 && resp.StatusCode != 206 {
 		errorMsg := "Got a non-200 or non-206 response when making request to URL associated with GUID " + fdrObject.GUID
@@ -348,13 +371,13 @@ func GeneratePresignedURL(g3 Gen3Interface, filename string, fileMetadata common
 
 // GenerateUploadRequest helps preparing the HTTP request for upload and the progress bar for single part upload
 func GenerateUploadRequest(g3 Gen3Interface, furObject commonUtils.FileUploadRequestObject, file *os.File) (commonUtils.FileUploadRequestObject, error) {
-        if furObject.PresignedURL == "" {
-               endPointPostfix := commonUtils.FenceDataUploadEndpoint + "/" + furObject.GUID + "?file_name=" + url.QueryEscape(furObject.Filename)
+	if furObject.PresignedURL == "" {
+		endPointPostfix := commonUtils.FenceDataUploadEndpoint + "/" + furObject.GUID + "?file_name=" + url.QueryEscape(furObject.Filename)
 
-                // ensure bucket is set
-                if furObject.Bucket != "" {
-                    endPointPostfix += "&bucket=" + furObject.Bucket
-                }
+		// ensure bucket is set
+		if furObject.Bucket != "" {
+			endPointPostfix += "&bucket=" + furObject.Bucket
+		}
 
 		msg, err := g3.DoRequestWithSignedHeader(&profileConfig, endPointPostfix, "application/json", nil)
 		if err != nil && !strings.Contains(err.Error(), "No GUID found") {
@@ -603,9 +626,9 @@ func batchUpload(gen3Interface Gen3Interface, furObjects []commonUtils.FileUploa
 	var guid string
 
 	for i := range furObjects {
-                if furObjects[i].Bucket == "" {
-                    furObjects[i].Bucket = bucketName
-                }
+		if furObjects[i].Bucket == "" {
+			furObjects[i].Bucket = bucketName
+		}
 		if furObjects[i].GUID == "" {
 			respURL, guid, err = GeneratePresignedURL(gen3Interface, furObjects[i].Filename, furObjects[i].FileMetadata, bucketName)
 			if err != nil {
