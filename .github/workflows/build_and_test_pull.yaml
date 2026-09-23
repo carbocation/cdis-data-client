@@ -11,10 +11,10 @@ jobs:
           - name: Checkout Code
             uses: actions/checkout@v4
 
-          - name: Setup Go 1.17
-            uses: actions/setup-go@v4
+          - name: Setup Go 1.24
+            uses: actions/setup-go@v5
             with:
-              go-version: '1.17'
+              go-version: '1.24'
 
           - name: Run Setup Script
             run: |
@@ -28,8 +28,6 @@ jobs:
             run: go test -v github.com/uc-cdis/gen3-client/tests
 
     build:
-        env:
-          goarch: amd64
         needs: test
         runs-on: ubuntu-latest
         strategy:
@@ -41,6 +39,9 @@ jobs:
               - goos: darwin
                 goarch: amd64
                 zipfile: dataclient_osx.zip
+              - goos: darwin
+                goarch: arm64
+                zipfile: dataclient_osx_arm64.zip
               - goos: windows
                 goarch: amd64
                 zipfile: dataclient_win64.zip
@@ -48,10 +49,10 @@ jobs:
           - name: Checkout Code
             uses: actions/checkout@v4
 
-          - name: Setup Go 1.17
-            uses: actions/setup-go@v4
+          - name: Setup Go 1.24
+            uses: actions/setup-go@v5
             with:
-              go-version: '1.17'
+              go-version: '1.24'
 
           - name: Run Setup Script
             run: |
@@ -67,6 +68,6 @@ jobs:
               bash .github/scripts/build.sh
             env:
               GOOS: ${{ matrix.goos }}
-              GOARCH: ${{ env.goarch }}
+              GOARCH: ${{ matrix.goarch }}
               GITHUB_BRANCH: ${{ github.ref_name }}
               GITHUB_PULL_REQUEST: ${{ github.event_name == 'pull_request' }}

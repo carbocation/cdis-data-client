@@ -11,6 +11,19 @@ Read more about what it does and how to use it in the `gen3-client` [user guide]
 
 ## Installation
 
+### macOS Apple Silicon
+
+Tagged releases from this workflow are configured to include `dataclient_osx_arm64.pkg` for Apple Silicon Macs. The existing `dataclient_osx.pkg` is for Intel Macs. Install the package that matches your Mac; both install the command-line executable at `/Applications/gen3-client`.
+
+To build an unsigned Apple Silicon executable locally from this repository, run:
+
+```sh
+./scripts/build-macos-arm64.sh
+./dist/gen3-client help
+```
+
+The script requires macOS and Go. CI builds the arm64 and Intel executables separately, then signs and notarizes a package for each architecture. The Apple Silicon package is published as a separate release asset.
+
 (The following instruction is for compiling and installing the `gen3-client` from source code. There are also binary executables can be found at [here](https://github.com/uc-cdis/cdis-data-client/releases))
 
 First, [install Go and the Go tools](https://golang.org/doc/install) if you have not already done so. [Set up your workspace and your GOPATH.](https://golang.org/doc/code.html)
