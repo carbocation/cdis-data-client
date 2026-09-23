@@ -3,6 +3,7 @@ package g3cmd
 import (
 	"bytes"
 	"encoding/json"
+	"encoding/xml"
 	"errors"
 	"fmt"
 	"io"
@@ -256,7 +257,7 @@ func GetDownloadResponse(g3 Gen3Interface, fdrObject *commonUtils.FileDownloadRe
 		if parseErr != nil || routeURL.Hostname() == "" {
 			log.Printf("Download debug: signer=%s protocol=%s url_host=unavailable", signer, protocol)
 		} else {
-			log.Printf("Download debug: signer=%s protocol=%s url_scheme=%s url_host=%s", signer, protocol, routeURL.Scheme, routeURL.Hostname())
+			log.Printf("Download debug: signer=%s protocol=%s url_scheme=%s url_host=%s signature_marker=%s", signer, protocol, routeURL.Scheme, routeURL.Hostname(), signedURLSignatureType(routeURL))
 		}
 	}
 	fdrObject.URL = fileDownloadURL
@@ -290,12 +291,41 @@ func GetDownloadResponse(g3 Gen3Interface, fdrObject *commonUtils.FileDownloadRe
 		log.Printf("Download debug: http_status=%d final_url_host=%s", resp.StatusCode, finalHost)
 	}
 	if resp.StatusCode != 200 && resp.StatusCode != 206 {
+		if fdrObject.Debug {
+			var storageError struct {
+				Code string `xml:"Code"`
+			}
+			limitedBody, readErr := ioutil.ReadAll(io.LimitReader(resp.Body, 16*1024))
+			if readErr == nil && xml.Unmarshal(limitedBody, &storageError) == nil && storageError.Code != "" {
+				log.Printf("Download debug: storage_error_code=%q", storageError.Code)
+			}
+		}
+		resp.Body.Close() // nolint:errcheck
 		errorMsg := "Got a non-200 or non-206 response when making request to URL associated with GUID " + fdrObject.GUID
 		errorMsg += "\n HTTP status code for response: " + strconv.Itoa(resp.StatusCode)
 		return errors.New(errorMsg)
 	}
 	fdrObject.Response = resp
 	return nil
+}
+
+func signedURLSignatureType(downloadURL *url.URL) string {
+	queryKeys := make(map[string]bool)
+	for key, values := range downloadURL.Query() {
+		for _, value := range values {
+			if value != "" {
+				queryKeys[strings.ToLower(key)] = true
+				break
+			}
+		}
+	}
+	if queryKeys["x-goog-signature"] || queryKeys["x-amz-signature"] {
+		return "v4-present"
+	}
+	if queryKeys["signature"] && queryKeys["googleaccessid"] {
+		return "v2-present"
+	}
+	return "none-detected"
 }
 
 func sanitizeErrorMsg(errorMsg string, sensitiveURL string) string {

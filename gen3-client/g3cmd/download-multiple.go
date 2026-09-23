@@ -319,7 +319,9 @@ func downloadFile(objects []ManifestObject, downloadPath string, filenameFormat 
 	log.Printf("Total number of objects in manifest: %d", len(objects))
 	log.Println("Preparing file info for each file, please wait...")
 	fileInfoBar := pb.New(len(objects)).SetRefreshRate(time.Millisecond * 10)
-	fileInfoBar.Start()
+	if !debug {
+		fileInfoBar.Start()
+	}
 	for _, obj := range objects {
 		if obj.ObjectID == "" {
 			log.Println("Found empty object_id (GUID), skipping this entry")
@@ -339,9 +341,13 @@ func downloadFile(objects []ManifestObject, downloadPath string, filenameFormat 
 		fdrObject.GUID = obj.ObjectID
 		fdrObject.Debug = debug
 		fdrObjects = append(fdrObjects, fdrObject)
-		fileInfoBar.Increment()
+		if !debug {
+			fileInfoBar.Increment()
+		}
 	}
-	fileInfoBar.Finish()
+	if !debug {
+		fileInfoBar.Finish()
+	}
 	log.Println("File info prepared successfully")
 
 	totalCompeleted := 0
