@@ -178,6 +178,12 @@ func TestGetDownloadResponseDebugRedactsSignedURL(t *testing.T) {
 			client.EXPECT().DoRequestWithSignedHeader(
 				gomock.Any(), commonUtils.FenceDataDownloadEndpoint+"/"+guid+tc.protocolText, "", nil,
 			).Return(jwt.JsonMessage{URL: tc.signedURL}, nil)
+			client.EXPECT().DoRequestWithSignedHeader(
+				gomock.Any(), commonUtils.IndexdIndexEndpoint+"/"+guid, "", nil,
+			).Return(jwt.JsonMessage{URLs: []string{
+				"gs://private-gcs-bucket/private-file.xml?secret-indexd-value",
+				"s3://private-s3-bucket/private-file.xml",
+			}}, nil)
 			client.EXPECT().MakeARequest(
 				http.MethodGet, tc.signedURL, "", "", map[string]string{}, nil, true,
 			).Return(response, nil)
@@ -195,6 +201,7 @@ func TestGetDownloadResponseDebugRedactsSignedURL(t *testing.T) {
 			for _, want := range []string{
 				"signer=fence protocol=" + tc.protocolLog,
 				"url_scheme=https url_host=bucket.example.org signature_marker=" + tc.signature,
+				"indexd_location_protocols=gs,s3",
 				fmt.Sprintf("http_status=%d final_url_host=bucket.example.org", tc.status),
 			} {
 				if !strings.Contains(logged, want) {
@@ -204,7 +211,7 @@ func TestGetDownloadResponseDebugRedactsSignedURL(t *testing.T) {
 			if tc.status == http.StatusForbidden && !strings.Contains(logged, `storage_error_code="SignatureDoesNotMatch"`) {
 				t.Errorf("debug log missing storage error code: %s", logged)
 			}
-			for _, secret := range []string{"private/file.xml", "X-Amz-Signature", "X-Goog-Signature", "secret-token", "secret-inner-message"} {
+			for _, secret := range []string{"private/file.xml", "X-Amz-Signature", "X-Goog-Signature", "secret-token", "secret-inner-message", "private-gcs-bucket", "private-s3-bucket", "secret-indexd-value"} {
 				if strings.Contains(logged, secret) {
 					t.Errorf("debug log exposed signed URL content %q", secret)
 				}

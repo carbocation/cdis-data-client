@@ -259,6 +259,9 @@ func GetDownloadResponse(g3 Gen3Interface, fdrObject *commonUtils.FileDownloadRe
 		} else {
 			log.Printf("Download debug: signer=%s protocol=%s url_scheme=%s url_host=%s signature_marker=%s", signer, protocol, routeURL.Scheme, routeURL.Hostname(), signedURLSignatureType(routeURL))
 		}
+		if signer == "fence" {
+			logIndexedLocationProtocols(g3, fdrObject.GUID)
+		}
 	}
 	fdrObject.URL = fileDownloadURL
 	if fdrObject.Range != 0 && !strings.Contains(fdrObject.URL, "X-Amz-Signature") && !strings.Contains(fdrObject.URL, "X-Goog-Signature") { // Not S3 or GS URLs and we want resume, send HEAD req first to check if server supports range
@@ -307,6 +310,33 @@ func GetDownloadResponse(g3 Gen3Interface, fdrObject *commonUtils.FileDownloadRe
 	}
 	fdrObject.Response = resp
 	return nil
+}
+
+// logIndexedLocationProtocols exposes only the order of protocols in the
+// current Indexd record. Fence uses the first location when no protocol is
+// requested, but the full URLs may contain private bucket and object names.
+func logIndexedLocationProtocols(g3 Gen3Interface, guid string) {
+	endpoint := commonUtils.IndexdIndexEndpoint + "/" + guid
+	indexed, err := g3.DoRequestWithSignedHeader(&profileConfig, endpoint, "", nil)
+	if err != nil {
+		log.Print("Download debug: indexd_location_protocols=unavailable")
+		return
+	}
+	protocols := make([]string, 0, len(indexed.URLs))
+	for _, indexedURL := range indexed.URLs {
+		parsed, parseErr := url.Parse(indexedURL)
+		if parseErr != nil {
+			protocols = append(protocols, "unknown")
+		} else {
+			switch strings.ToLower(parsed.Scheme) {
+			case "s3", "gs", "az", "http", "https", "ftp":
+				protocols = append(protocols, strings.ToLower(parsed.Scheme))
+			default:
+				protocols = append(protocols, "unknown")
+			}
+		}
+	}
+	log.Printf("Download debug: indexd_location_protocols=%s", strings.Join(protocols, ","))
 }
 
 func signedURLSignatureType(downloadURL *url.URL) string {
