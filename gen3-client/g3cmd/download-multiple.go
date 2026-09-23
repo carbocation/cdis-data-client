@@ -246,6 +246,9 @@ func batchDownload(g3 Gen3Interface, batchFDRSlice []commonUtils.FileDownloadRes
 		defer fdrObject.Response.Body.Close()
 		defer bar.Finish()
 	}
+	if len(fdrs) == 0 {
+		return 0
+	}
 
 	fdrCh := make(chan commonUtils.FileDownloadResponseObject, len(fdrs))
 	pool, err := pb.StartPool(bars...)
