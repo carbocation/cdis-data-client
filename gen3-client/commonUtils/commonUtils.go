@@ -84,6 +84,8 @@ type FileDownloadResponseObject struct {
 	GUID         string
 	Debug        bool
 	URL          string
+	ExpectedSize int64
+	ExpectedMD5  string
 	Range        int64
 	Overwrite    bool
 	Skip         bool

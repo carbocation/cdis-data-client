@@ -140,6 +140,33 @@ func TestGetDownloadResponse_noShepherd(t *testing.T) {
 	}
 }
 
+func TestGetDownloadResponseResumesWithLowercaseGCSSignature(t *testing.T) {
+	const guid = "dg.4503/00000000-0000-0000-0000-000000000000"
+	const signedURL = "https://bucket.storage.googleapis.com/file.xml?x-goog-signature=secret-token"
+	controller := gomock.NewController(t)
+	defer controller.Finish()
+	client := mocks.NewMockGen3Interface(controller)
+	client.EXPECT().CheckForShepherdAPI(gomock.Any()).Return(false, nil)
+	client.EXPECT().DoRequestWithSignedHeader(
+		gomock.Any(), commonUtils.FenceDataDownloadEndpoint+"/"+guid, "", nil,
+	).Return(jwt.JsonMessage{URL: signedURL}, nil)
+	client.EXPECT().MakeARequest(
+		http.MethodGet, signedURL, "", "", map[string]string{"Range": "bytes=3-"}, nil, true,
+	).Return(&http.Response{
+		StatusCode: http.StatusPartialContent,
+		Body:       ioutil.NopCloser(strings.NewReader("def")),
+	}, nil)
+
+	file := commonUtils.FileDownloadResponseObject{GUID: guid, Range: 3}
+	if err := g3cmd.GetDownloadResponse(client, &file, ""); err != nil {
+		t.Fatal(err)
+	}
+	defer file.Response.Body.Close()
+	if file.Range != 3 {
+		t.Fatalf("resume offset changed to %d", file.Range)
+	}
+}
+
 func TestGetDownloadResponseDebugRedactsSignedURL(t *testing.T) {
 	for _, tc := range []struct {
 		name         string

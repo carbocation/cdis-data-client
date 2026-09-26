@@ -4,9 +4,9 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"io"
 	"io/ioutil"
 	"log"
+	"net/http"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -179,106 +179,104 @@ func validateFilenameFormat(downloadPath string, filenameFormat string, rename b
 	}
 }
 
-func validateLocalFileStat(downloadPath string, filename string, filesize int64, skipCompleted bool) commonUtils.FileDownloadResponseObject {
-	fi, err := os.Stat(downloadPath + filename) // check filename for local existence
-	if err != nil {
-		if os.IsNotExist(err) {
-			return commonUtils.FileDownloadResponseObject{DownloadPath: downloadPath, Filename: filename} // no local file, normal full length download
-		}
-		log.Printf("Error occurred when getting information for file \"%s\": %s\n", downloadPath+filename, err.Error())
-		log.Println("Will try to download the whole file")
-		return commonUtils.FileDownloadResponseObject{DownloadPath: downloadPath, Filename: filename} // errorred when trying to get local FI, normal full length download
+func validateLocalFileStat(downloadPath string, filename string, filesize int64, md5sum string, skipCompleted bool) commonUtils.FileDownloadResponseObject {
+	result := commonUtils.FileDownloadResponseObject{
+		DownloadPath: downloadPath,
+		Filename:     filename,
+		ExpectedSize: filesize,
+		ExpectedMD5:  md5sum,
 	}
-
-	// have existing local file and may want to skip, check more conditions
 	if !skipCompleted {
-		return commonUtils.FileDownloadResponseObject{DownloadPath: downloadPath, Filename: filename, Overwrite: true} // not skipping any local files, normal full length download
+		return result
 	}
 
-	localFilesize := fi.Size()
-	if localFilesize == filesize {
-		return commonUtils.FileDownloadResponseObject{DownloadPath: downloadPath, Filename: filename, Skip: true} // both filename and filesize matches, consider as completed
+	finalPath := filepath.Join(downloadPath, filename)
+	if fi, err := os.Stat(finalPath); err == nil && filesize > 0 && fi.Size() == filesize {
+		if md5sum == "" || verifyFileMD5(finalPath, md5sum) == nil {
+			result.Skip = true
+			return result
+		}
 	}
-	if localFilesize > filesize {
-		return commonUtils.FileDownloadResponseObject{DownloadPath: downloadPath, Filename: filename, Overwrite: true} // local filesize is greater than INDEXD record, overwrite local existing
+
+	// Only staged bytes are eligible for resumption. An older client may have
+	// left an incomplete file at the final path; replace it only after a new
+	// staged download has passed validation.
+	if fi, err := os.Stat(stagingPath(finalPath)); err == nil && fi.Size() > 0 && (filesize == 0 || fi.Size() < filesize) {
+		result.Range = fi.Size()
 	}
-	// local filesize is less than INDEXD record, try ranged download
-	return commonUtils.FileDownloadResponseObject{DownloadPath: downloadPath, Filename: filename, Range: localFilesize}
+	return result
 }
 
 func batchDownload(g3 Gen3Interface, batchFDRSlice []commonUtils.FileDownloadResponseObject, protocolText string, workers int, errCh chan error) int {
+	type downloadJob struct {
+		object commonUtils.FileDownloadResponseObject
+		bar    *pb.ProgressBar
+	}
 	bars := make([]*pb.ProgressBar, 0)
-	fdrs := make([]commonUtils.FileDownloadResponseObject, 0)
+	jobs := make([]downloadJob, 0)
 	for _, fdrObject := range batchFDRSlice {
 		err := GetDownloadResponse(g3, &fdrObject, protocolText)
 		if err != nil {
 			errCh <- err
 			continue
 		}
-
-		fileFlag := os.O_CREATE | os.O_RDWR
-		if fdrObject.Range != 0 {
-			fileFlag = os.O_APPEND | os.O_RDWR
-		} else if fdrObject.Overwrite {
-			fileFlag = os.O_TRUNC | os.O_RDWR
+		if fdrObject.Range > 0 && fdrObject.Response.StatusCode == http.StatusOK {
+			// The server ignored Range. Start this transfer from byte zero.
+			fdrObject.Range = 0
 		}
-
-		subDir := filepath.Dir(fdrObject.Filename)
-		if subDir != "." && subDir != "/" {
-			err = os.MkdirAll(fdrObject.DownloadPath+subDir, 0766)
-			if err != nil {
-				errCh <- err
-				continue
-			}
+		progressSize := fdrObject.ExpectedSize
+		if progressSize <= 0 {
+			progressSize = fdrObject.Response.ContentLength + fdrObject.Range
 		}
-		file, err := os.OpenFile(fdrObject.DownloadPath+fdrObject.Filename, fileFlag, 0666)
-		if err != nil {
-			errCh <- errors.New("Error occurred during opening local file: " + err.Error())
-			continue
+		if progressSize < 0 {
+			progressSize = 0
 		}
-		bar := pb.New64(fdrObject.Response.ContentLength + fdrObject.Range).SetUnits(pb.U_BYTES).SetRefreshRate(time.Millisecond * 10).Prefix(fdrObject.Filename + " ")
+		bar := pb.New64(progressSize).SetUnits(pb.U_BYTES).SetRefreshRate(time.Millisecond * 10).Prefix(fdrObject.Filename + " ")
 		bar.Set64(fdrObject.Range)
-		writer := io.MultiWriter(file, bar)
 		bars = append(bars, bar)
-		fdrObject.Writer = writer
-		fdrs = append(fdrs, fdrObject)
-		defer file.Close()
-		defer fdrObject.Response.Body.Close()
-		defer bar.Finish()
+		jobs = append(jobs, downloadJob{object: fdrObject, bar: bar})
 	}
-	if len(fdrs) == 0 {
+	if len(jobs) == 0 {
 		return 0
 	}
 
-	fdrCh := make(chan commonUtils.FileDownloadResponseObject, len(fdrs))
+	jobCh := make(chan downloadJob, len(jobs))
 	pool, err := pb.StartPool(bars...)
 	if err != nil {
+		for _, job := range jobs {
+			job.object.Response.Body.Close()
+		}
 		errCh <- errors.New("Error occurred during initializing progress bars: " + err.Error())
 		return 0
 	}
 
 	wg := sync.WaitGroup{}
-	succeeded := 0
+	results := make(chan error, len(jobs))
 	for i := 0; i < workers; i++ {
 		wg.Add(1)
 		go func() {
-			for fdr := range fdrCh {
-				if _, err = io.Copy(fdr.Writer, fdr.Response.Body); err != nil {
-					errCh <- errors.New("io.Copy error: " + err.Error())
-					return
-				}
-				succeeded++
+			defer wg.Done()
+			for job := range jobCh {
+				results <- downloadResponseToStage(job.object, job.bar)
 			}
-			wg.Done()
 		}()
 	}
 
-	for _, fdr := range fdrs {
-		fdrCh <- fdr
+	for _, job := range jobs {
+		jobCh <- job
 	}
-	close(fdrCh)
+	close(jobCh)
 
 	wg.Wait()
+	close(results)
+	succeeded := 0
+	for result := range results {
+		if result != nil {
+			errCh <- result
+		} else {
+			succeeded++
+		}
+	}
 	err = pool.Stop()
 	if err != nil {
 		errCh <- errors.New("Error occurred during stopping progress bars: " + err.Error())
@@ -287,7 +285,7 @@ func batchDownload(g3 Gen3Interface, batchFDRSlice []commonUtils.FileDownloadRes
 	return succeeded
 }
 
-func downloadFile(objects []ManifestObject, downloadPath string, filenameFormat string, rename bool, noPrompt bool, protocol string, numParallel int, skipCompleted bool, debug bool) {
+func downloadFile(objects []ManifestObject, downloadPath string, filenameFormat string, rename bool, noPrompt bool, protocol string, numParallel int, skipCompleted bool, debug bool) error {
 	if numParallel < 1 {
 		log.Fatalln("Invalid value for option \"numparallel\": must be a positive integer! Please check your input.")
 	}
@@ -316,6 +314,8 @@ func downloadFile(objects []ManifestObject, downloadPath string, filenameFormat 
 	renamedFiles := make([]RenamedOrSkippedFileInfo, 0)
 	skippedFiles := make([]RenamedOrSkippedFileInfo, 0)
 	fdrObjects := make([]commonUtils.FileDownloadResponseObject, 0)
+	preparationErrors := make([]error, 0)
+	seenFilenames := make(map[string]string)
 
 	gen3Interface := NewGen3Interface()
 
@@ -333,13 +333,26 @@ func downloadFile(objects []ManifestObject, downloadPath string, filenameFormat 
 		var fdrObject commonUtils.FileDownloadResponseObject
 		filename := obj.Filename
 		filesize := obj.Filesize
+		md5sum := obj.MD5Sum
+		if md5sum == "" {
+			md5sum = obj.FileMD5Sum
+		}
 		// only queries Gen3 services if any of these 2 values doesn't exists in manifest
 		if filename == "" || filesize == 0 {
 			filename, filesize = AskGen3ForFileInfo(gen3Interface, obj.ObjectID, protocol, downloadPath, filenameFormat, rename, &renamedFiles)
 		}
-		fdrObject = commonUtils.FileDownloadResponseObject{DownloadPath: downloadPath, Filename: filename}
+		destination := filepath.Clean(filepath.Join(downloadPath, filename))
+		if previousGUID, exists := seenFilenames[destination]; exists {
+			preparationErrors = append(preparationErrors, fmt.Errorf("duplicate output filename %q for GUIDs %s and %s; use unique file_name values in the manifest", filename, previousGUID, obj.ObjectID))
+			if !debug {
+				fileInfoBar.Increment()
+			}
+			continue
+		}
+		seenFilenames[destination] = obj.ObjectID
+		fdrObject = commonUtils.FileDownloadResponseObject{DownloadPath: downloadPath, Filename: filename, ExpectedSize: filesize, ExpectedMD5: md5sum}
 		if !rename {
-			fdrObject = validateLocalFileStat(downloadPath, filename, filesize, skipCompleted)
+			fdrObject = validateLocalFileStat(downloadPath, filename, filesize, md5sum, skipCompleted)
 		}
 		fdrObject.GUID = obj.ObjectID
 		fdrObject.Debug = debug
@@ -354,7 +367,11 @@ func downloadFile(objects []ManifestObject, downloadPath string, filenameFormat 
 	log.Println("File info prepared successfully")
 
 	totalCompeleted := 0
-	workers, _, errCh, _ := initBatchUploadChannels(numParallel, len(fdrObjects))
+	workers := getNumberOfWorkers(numParallel, len(fdrObjects))
+	errCh := make(chan error, len(objects)+numParallel+1)
+	for _, preparationError := range preparationErrors {
+		errCh <- preparationError
+	}
 	batchFDRSlice := make([]commonUtils.FileDownloadResponseObject, 0)
 	for _, fdrObject := range fdrObjects {
 		if fdrObject.Skip {
@@ -385,12 +402,15 @@ func downloadFile(objects []ManifestObject, downloadPath string, filenameFormat 
 		log.Printf("%d files have been skipped\n", len(skippedFiles))
 	}
 	if len(errCh) > 0 {
+		errorCount := len(errCh)
 		close(errCh)
-		log.Printf("%d files have encountered an error during downloading, detailed error messages are:\n", len(errCh))
+		log.Printf("%d files have encountered an error during downloading, detailed error messages are:\n", errorCount)
 		for err := range errCh {
 			log.Println(err.Error())
 		}
+		return fmt.Errorf("%d files failed to download", errorCount)
 	}
+	return nil
 }
 
 func init() {
@@ -406,9 +426,9 @@ func init() {
 	var downloadMultipleCmd = &cobra.Command{
 		Use:     "download-multiple",
 		Short:   "Download multiple of files from a specified manifest",
-		Long:    `Get presigned URLs for multiple of files specified in a manifest file and then download all of them.`,
+		Long:    `Get presigned URLs for files in a manifest. Each file is staged as .part and published under its final name only after size and optional MD5 verification. Include md5sum or file_md5sum in manifest entries to enable checksum verification.`,
 		Example: `./gen3-client download-multiple --profile=<profile-name> --manifest=<path-to-manifest/manifest.json> --download-path=<path-to-file-dir/>`,
-		Run: func(cmd *cobra.Command, args []string) {
+		RunE: func(cmd *cobra.Command, args []string) error {
 			// don't initialize transmission logs for non-uploading related commands
 			logs.SetToBoth()
 			profileConfig = conf.ParseConfig(profile)
@@ -443,11 +463,12 @@ func init() {
 				log.Fatalf("Error has occurred during unmarshalling manifest object: %v\n", err)
 			}
 
-			downloadFile(objects, downloadPath, filenameFormat, rename, noPrompt, protocol, numParallel, skipCompleted, false)
-			err = logs.CloseMessageLog()
-			if err != nil {
-				log.Println(err.Error())
+			downloadErr := downloadFile(objects, downloadPath, filenameFormat, rename, noPrompt, protocol, numParallel, skipCompleted, false)
+			closeErr := logs.CloseMessageLog()
+			if downloadErr != nil {
+				return downloadErr
 			}
+			return closeErr
 		},
 	}
 
@@ -461,6 +482,6 @@ func init() {
 	downloadMultipleCmd.Flags().BoolVar(&noPrompt, "no-prompt", false, "If set to true, will not display user prompt message for confirmation")
 	downloadMultipleCmd.Flags().StringVar(&protocol, "protocol", "", "Specify the preferred protocol with --protocol=s3")
 	downloadMultipleCmd.Flags().IntVar(&numParallel, "numparallel", 1, "Number of downloads to run in parallel")
-	downloadMultipleCmd.Flags().BoolVar(&skipCompleted, "skip-completed", false, "If set to true, will check for filename and size before download and skip any files in \"download-path\" that matches both")
+	downloadMultipleCmd.Flags().BoolVar(&skipCompleted, "skip-completed", false, "Skip finished files with matching size (and MD5 when provided); resume partial .part files")
 	RootCmd.AddCommand(downloadMultipleCmd)
 }

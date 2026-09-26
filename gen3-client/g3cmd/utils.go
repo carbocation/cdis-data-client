@@ -30,10 +30,12 @@ import (
 
 // ManifestObject represents an object from manifest that downloaded from windmill / data-portal
 type ManifestObject struct {
-	ObjectID  string `json:"object_id"`
-	SubjectID string `json:"subject_id"`
-	Filename  string `json:"file_name"`
-	Filesize  int64  `json:"file_size"`
+	ObjectID   string `json:"object_id"`
+	SubjectID  string `json:"subject_id"`
+	Filename   string `json:"file_name"`
+	Filesize   int64  `json:"file_size"`
+	MD5Sum     string `json:"md5sum,omitempty"`
+	FileMD5Sum string `json:"file_md5sum,omitempty"`
 }
 
 // InitRequestObject represents the payload that sends to FENCE for getting a singlepart upload presignedURL or init a multipart upload for new object file
@@ -264,13 +266,14 @@ func GetDownloadResponse(g3 Gen3Interface, fdrObject *commonUtils.FileDownloadRe
 		}
 	}
 	fdrObject.URL = fileDownloadURL
-	if fdrObject.Range != 0 && !strings.Contains(fdrObject.URL, "X-Amz-Signature") && !strings.Contains(fdrObject.URL, "X-Goog-Signature") { // Not S3 or GS URLs and we want resume, send HEAD req first to check if server supports range
+	if fdrObject.Range != 0 && !isSignedDownloadURL(fdrObject.URL) { // For unsigned URLs, check whether the server supports resuming.
 		resp, err := http.Head(fdrObject.URL)
 		if err != nil {
 			errorMsg := "Error occurred when sending HEAD req to URL associated with GUID " + fdrObject.GUID
 			errorMsg += "\n Details of error: " + sanitizeErrorMsg(err.Error(), fdrObject.URL)
 			return errors.New(errorMsg)
 		}
+		resp.Body.Close()                                // nolint:errcheck
 		if resp.Header.Get("Accept-Ranges") != "bytes" { // server does not support range, download without range header
 			fdrObject.Range = 0
 		}
@@ -356,6 +359,11 @@ func signedURLSignatureType(downloadURL *url.URL) string {
 		return "v2-present"
 	}
 	return "none-detected"
+}
+
+func isSignedDownloadURL(downloadURL string) bool {
+	parsed, err := url.Parse(downloadURL)
+	return err == nil && signedURLSignatureType(parsed) != "none-detected"
 }
 
 func sanitizeErrorMsg(errorMsg string, sensitiveURL string) string {
